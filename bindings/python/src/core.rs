@@ -695,7 +695,12 @@ impl rpc::RpcService for PythonRpcService {
         })
     }
 
-    async fn handle_request(&self, method: &str, request: rpc::RpcRequest) -> RpcResult<rpc::RpcResponse> {
+    async fn handle_request(
+        &self,
+        _ctx: rpc::RpcContext,
+        method: &str,
+        request: rpc::RpcRequest,
+    ) -> RpcResult<rpc::RpcResponse> {
         let method_name = format!("_handle_{}", method);
         let instance_ptr = Python::with_gil(|_py| {
             self.instance.clone()
@@ -732,7 +737,12 @@ impl rpc::RpcService for PythonRpcService {
         }
     }
 
-    async fn handle_stream(&self, method: &str, request: StreamRequest) -> RpcResult<rpc::StreamResponse> {
+    async fn handle_stream(
+        &self,
+        _ctx: rpc::RpcContext,
+        method: &str,
+        request: StreamRequest,
+    ) -> RpcResult<rpc::StreamResponse> {
         let method_name = format!("_handle_stream_{}", method);
 
         let instance_ptr = Python::with_gil(|_py| {
@@ -774,7 +784,12 @@ impl rpc::RpcService for PythonRpcService {
         }
     }
 
-    async fn handle_stream_iter(&self, method: &str, request: StreamRequest) -> RpcResult<Option<Receiver<Vec<u8>>>> {
+    async fn handle_stream_iter(
+        &self,
+        _ctx: rpc::RpcContext,
+        method: &str,
+        request: StreamRequest,
+    ) -> RpcResult<Option<Receiver<Vec<u8>>>> {
         let method_name = format!("_handle_stream_iter_{}", method);
         let has_iter = Python::with_gil(|py| {
             let inst = self.instance.bind(py);

@@ -17,6 +17,7 @@ use tokio::task::JoinHandle;
 use fnv::{FnvHashMap};
 use uuid::Uuid;
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
+use tokio::sync::{broadcast, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use std::time::{Duration, Instant};
 use blockstore::{Blockstore, SledBlockstore};
@@ -41,6 +42,24 @@ pub enum Command{
     StartProviding(RecordKey, oneshot::Sender<Result<()>>),
     GetProviders(RecordKey, oneshot::Sender<Result<Vec<PeerId>>>),
     StopProviding(RecordKey, oneshot::Sender<Result<()>>),
+
+    GossipsubSubscribe(String, oneshot::Sender<Result<()>>),
+    GossipsubUnsubscribe(String, oneshot::Sender<Result<()>>),
+    GossipsubPublish(String, Vec<u8>, oneshot::Sender<Result<libp2p::gossipsub::MessageId>>),
+}
+
+#[derive(Debug, Clone)]
+pub struct GossipMessage {
+    pub topic: String,
+    pub source: Option<PeerId>,
+    pub data: Vec<u8>,
+    pub message_id: libp2p::gossipsub::MessageId,
+}
+
+#[derive(Debug, Clone)]
+pub enum ConnectionEvent {
+    Connected { peer_id: PeerId, address: Multiaddr },
+    Disconnected { peer_id: PeerId },
 }
 
 #[derive(Clone)]
@@ -50,7 +69,10 @@ pub struct Lattica {
     config: Arc<Config>,
     address_book: Arc<RwLock<AddressBook>>,
     storage: Arc<SledBlockstore>,
-    symmetric_nat: Arc<RwLock<Option<bool>>>
+    symmetric_nat: Arc<RwLock<Option<bool>>>,
+    gossip_tx: broadcast::Sender<GossipMessage>,
+    connection_tx: broadcast::Sender<ConnectionEvent>,
+    listen_addrs_rx: watch::Receiver<Vec<Multiaddr>>,
 }
 
 pub struct LatticaBuilder {
@@ -281,6 +303,10 @@ impl LatticaBuilder {
 
         let (cmd_tx, cmd_rx) = mpsc::channel(100);
 
+        let (gossip_tx, _) = broadcast::channel::<GossipMessage>(1024);
+        let (connection_tx, _) = broadcast::channel::<ConnectionEvent>(256);
+        let (listen_addrs_tx, listen_addrs_rx) = watch::channel::<Vec<Multiaddr>>(Vec::new());
+
         let address_book = AddressBook::new();
         let address_book_arc = Arc::new(RwLock::new(address_book));
         let address_book_clone = address_book_arc.clone();
@@ -291,6 +317,9 @@ impl LatticaBuilder {
                 swarm,
                 self.config.clone(),
                 address_book_clone,
+                gossip_tx.clone(),
+                connection_tx.clone(),
+                listen_addrs_tx,
             )
         );
 
@@ -305,6 +334,9 @@ impl LatticaBuilder {
             address_book: address_book_arc,
             storage: storage_arc,
             symmetric_nat,
+            gossip_tx,
+            connection_tx,
+            listen_addrs_rx,
         };
 
         Ok(lattica)
@@ -507,6 +539,37 @@ impl Lattica {
         self.config.keypair.public().to_peer_id()
     }
 
+    pub fn subscribe_gossip(&self) -> broadcast::Receiver<GossipMessage> {
+        self.gossip_tx.subscribe()
+    }
+
+    pub fn subscribe_connections(&self) -> broadcast::Receiver<ConnectionEvent> {
+        self.connection_tx.subscribe()
+    }
+
+    pub fn listen_addrs(&self) -> Vec<Multiaddr> {
+        self.listen_addrs_rx.borrow().clone()
+    }
+
+    pub async fn wait_for_listen_addrs(&self, timeout: Duration) -> Result<Vec<Multiaddr>> {
+        if !self.listen_addrs_rx.borrow().is_empty() {
+            return Ok(self.listen_addrs_rx.borrow().clone());
+        }
+
+        tokio::time::timeout(timeout, async {
+            let mut rx = self.listen_addrs_rx.clone();
+            loop {
+                rx.changed().await.map_err(|_| anyhow!("listen addrs channel closed"))?;
+                let addrs = rx.borrow().clone();
+                if !addrs.is_empty() {
+                    return Ok(addrs);
+                }
+            }
+        })
+        .await
+        .map_err(|_| anyhow!("timeout waiting for listen addresses"))?
+    }
+
     pub async fn get_record(&self, key:RecordKey,  quorum: Quorum) -> Result<Vec<PeerRecord>>{
         let (tx, rx) = oneshot::channel();
         self.cmd.try_send(Command::GetRecord(key, quorum, tx))?;
@@ -662,7 +725,7 @@ impl Lattica {
         rx.await?
     }
 
-    pub async fn dial(&mut self, addr: Multiaddr) -> Result<()> {
+    pub async fn dial(&self, addr: Multiaddr) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.cmd.try_send(Command::Dial(addr, tx))?;
         rx.await?
@@ -719,6 +782,30 @@ impl Lattica {
         Ok(result)
     }
 
+    pub async fn call_stream_with_id(
+        &self,
+        peer_id: PeerId,
+        request_id: String,
+        method: String,
+        data: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd.try_send(Command::RpcGetOrCreateStreamHandle(peer_id, tx))?;
+        let handle = rx.await??;
+
+        let (response_tx, response_rx) = oneshot::channel();
+        handle
+            .register_unary_call(request_id.clone(), response_tx)
+            .await;
+        handle.send_request(request_id, method, data).await?;
+
+        let result = response_rx
+            .await
+            .map_err(|_| anyhow!("Response channel closed"))?;
+
+        Ok(result)
+    }
+
     pub async fn call_stream_iter(&self, peer_id: PeerId, method: String, data: Vec<u8>) -> Result<(String, mpsc::Receiver<Vec<u8>>)> {
         let request_id = Uuid::new_v4().to_string();
         // get stream handle
@@ -732,6 +819,27 @@ impl Lattica {
         handle.send_request(request_id.clone(), method, data).await?;
 
         Ok((request_id, out_rx))
+    }
+
+    pub async fn call_stream_iter_with_id(
+        &self,
+        peer_id: PeerId,
+        request_id: String,
+        method: String,
+        data: Vec<u8>,
+    ) -> Result<mpsc::Receiver<Vec<u8>>> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd
+            .try_send(Command::RpcGetOrCreateStreamHandle(peer_id, tx))?;
+        let handle = rx.await??;
+
+        let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(512);
+        handle
+            .register_stream_call(request_id.clone(), out_tx)
+            .await;
+        handle.send_request(request_id, method, data).await?;
+
+        Ok(out_rx)
     }
 
     pub async fn cancel_stream_iter(&self, peer_id: PeerId, request_id: String) -> Result<()> {
@@ -751,6 +859,24 @@ impl Lattica {
     pub async fn register_service(&self, service: Box<dyn rpc::RpcService>) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.cmd.try_send(Command::RpcRegister(service, tx))?;
+        rx.await?
+    }
+
+    pub async fn subscribe_topic(&self, topic: String) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd.try_send(Command::GossipsubSubscribe(topic, tx))?;
+        rx.await?
+    }
+
+    pub async fn unsubscribe_topic(&self, topic: String) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd.try_send(Command::GossipsubUnsubscribe(topic, tx))?;
+        rx.await?
+    }
+
+    pub async fn publish(&self, topic: String, data: Vec<u8>) -> Result<libp2p::gossipsub::MessageId> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd.try_send(Command::GossipsubPublish(topic, data, tx))?;
         rx.await?
     }
 
@@ -904,9 +1030,12 @@ impl Drop for Lattica {
 
 async fn swarm_poll(
     cmd_rx: mpsc::Receiver<Command>,
-    mut swarm: Swarm<LatticaBehaviour>,
+    mut swarm:Swarm<LatticaBehaviour>,
     config: Config,
     address_book: Arc<RwLock<AddressBook>>,
+    gossip_tx: broadcast::Sender<GossipMessage>,
+    connection_tx: broadcast::Sender<ConnectionEvent>,
+    listen_addrs_tx: watch::Sender<Vec<Multiaddr>>,
 ) {
     let services = Arc::new(RwLock::new(HashMap::<String, Box<dyn rpc::RpcService>>::new()));
     let mut pending_requests: HashMap<OutboundRequestId, oneshot::Sender<Result<rpc::RpcResponse>>> = HashMap::new();
@@ -917,10 +1046,10 @@ async fn swarm_poll(
     let services_stream = services.clone();
 
     tokio::spawn(async move {
-        while let Some((_, stream)) = incoming_streams.next().await {
+        while let Some((peer_id, stream)) = incoming_streams.next().await {
             let services_clone = services_stream.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_incoming_stream(stream, services_clone).await {
+                if let Err(e) = handle_incoming_stream(peer_id, stream, services_clone).await {
                     tracing::error!("failed to handle incoming stream: {}", e);
                 }
             });
@@ -951,11 +1080,13 @@ async fn swarm_poll(
             Either::Left((Some(e), _)) => match e {
                 SwarmEvent::NewListenAddr { address, .. } => {
                     tracing::info!("Listening on: {}", address.with_p2p(swarm.local_peer_id().clone()).unwrap());
+                    let addrs = swarm.listeners().cloned().collect::<Vec<_>>();
+                    let _ = listen_addrs_tx.send(addrs);
                 }
                 SwarmEvent::ConnectionEstablished { peer_id, endpoint, connection_id, .. } => {
                     let remote_addr = endpoint.get_remote_address();
                     let remote_protocol = common::get_transport_protocol(remote_addr);
-                    let is_direct = !endpoint.get_remote_address().to_string().contains("p2p-circuit");
+                    let is_direct = !remote_addr.to_string().contains("p2p-circuit");
 
                     if !remote_protocol.is_none() {
                         tracing::info!("Connection established with peer: {}, via: {}, use: {:?}, is_direct: {}", peer_id, remote_addr, remote_protocol, is_direct);
@@ -983,10 +1114,17 @@ async fn swarm_poll(
                     }
 
                     tracing::debug!("Added connection info to AddressBook for peer {}", peer_id);
+
+                    let _ = connection_tx.send(ConnectionEvent::Connected {
+                        peer_id,
+                        address: remote_addr.clone(),
+                    });
                 }
                 SwarmEvent::ConnectionClosed { peer_id,.. } => {
                     tracing::debug!("swarm stream closed, terminating {:?}", e);
                     swarm.behaviour_mut().connection_closed(peer_id);
+
+                    let _ = connection_tx.send(ConnectionEvent::Disconnected { peer_id });
                 }
                 SwarmEvent::Behaviour(event) => {
                     match event {
@@ -1059,6 +1197,14 @@ async fn swarm_poll(
                         }
                         LatticaBehaviourEvent::Gossipsub(gossipsub_event) => {
                             tracing::debug!("gossipsub event {:?}", gossipsub_event);
+                            if let libp2p::gossipsub::Event::Message { message, message_id, .. } = &gossipsub_event {
+                                let _ = gossip_tx.send(GossipMessage {
+                                    topic: message.topic.as_str().to_string(),
+                                    source: message.source,
+                                    data: message.data.clone(),
+                                    message_id: message_id.clone(),
+                                });
+                            }
                             handle_gossipsub_event(gossipsub_event, &mut swarm, &pending_relay_addrs).await;
                         }
                         LatticaBehaviourEvent::Bitswap(bitswap_event) => {
@@ -1169,6 +1315,34 @@ async fn swarm_poll(
                 }
                 Command::StopProviding(key, tx) => {
                     swarm.behaviour_mut().stop_providing(key, tx);
+                }
+                Command::GossipsubSubscribe(topic, tx) => {
+                    let ident = libp2p::gossipsub::IdentTopic::new(topic);
+                    let result = match swarm.behaviour_mut().gossipsub.subscribe(&ident) {
+                        Ok(true) => Ok(()),
+                        Ok(false) => Err(anyhow!("Failed to subscribe to topic")),
+                        Err(e) => Err(anyhow!(e.to_string())),
+                    };
+                    let _ = tx.send(result);
+                }
+                Command::GossipsubUnsubscribe(topic, tx) => {
+                    let ident = libp2p::gossipsub::IdentTopic::new(topic);
+                    let ok = swarm.behaviour_mut().gossipsub.unsubscribe(&ident);
+                    let result = if ok {
+                        Ok(())
+                    } else {
+                        Err(anyhow!("Failed to unsubscribe from topic"))
+                    };
+                    let _ = tx.send(result);
+                }
+                Command::GossipsubPublish(topic, data, tx) => {
+                    let ident = libp2p::gossipsub::IdentTopic::new(topic);
+                    let result = swarm
+                        .behaviour_mut()
+                        .gossipsub
+                        .publish(ident, data)
+                        .map_err(|e| anyhow!(e.to_string()));
+                    let _ = tx.send(result);
                 }
             }
         }

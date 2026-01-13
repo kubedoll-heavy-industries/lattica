@@ -11,6 +11,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 use crate::common::CompressionAlgorithm;
 use tokio::sync::mpsc;
+use libp2p::PeerId;
 
 pub const RPC_REQUEST_RESPONSE_PROTOCOL: StreamProtocol = StreamProtocol::new("/rpc/req-resp/1.0.0");
 pub const RPC_STREAM_PROTOCOL: StreamProtocol = StreamProtocol::new("/rpc/stream/1.0.0");
@@ -87,13 +88,33 @@ impl fmt::Display for RpcError {
 impl std::error::Error for RpcError {}
 pub type RpcResult<T> = Result<T, String>;
 
+#[derive(Debug, Clone)]
+pub struct RpcContext {
+    pub remote_peer_id: PeerId,
+}
+
 #[async_trait]
 pub trait RpcService: Send + Sync {
     fn service_name(&self) -> &str;
     fn methods(&self) -> Vec<String>;
-    async fn handle_request(&self, method: &str, request: RpcRequest) -> RpcResult<RpcResponse>;
-    async fn handle_stream(&self, method: &str, request: StreamRequest) -> RpcResult<StreamResponse>;
-    async fn handle_stream_iter(&self, method: &str, request: StreamRequest) -> RpcResult<Option<mpsc::Receiver<Vec<u8>>>>;
+    async fn handle_request(
+        &self,
+        ctx: RpcContext,
+        method: &str,
+        request: RpcRequest,
+    ) -> RpcResult<RpcResponse>;
+    async fn handle_stream(
+        &self,
+        ctx: RpcContext,
+        method: &str,
+        request: StreamRequest,
+    ) -> RpcResult<StreamResponse>;
+    async fn handle_stream_iter(
+        &self,
+        ctx: RpcContext,
+        method: &str,
+        request: StreamRequest,
+    ) -> RpcResult<Option<mpsc::Receiver<Vec<u8>>>>;
 }
 
 #[derive(Debug, Clone, Default)]

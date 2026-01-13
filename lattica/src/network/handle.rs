@@ -19,7 +19,11 @@ use libp2p::kad::{AddProviderOk, GetProvidersOk};
 use std::sync::atomic::{AtomicBool, Ordering};
 use futures::io::{WriteHalf};
 
-pub(crate) async fn handle_incoming_stream(stream: Stream, services: Arc<RwLock<HashMap<String, Box<dyn rpc::RpcService>>>>) -> Result<()> {
+pub(crate) async fn handle_incoming_stream(
+    peer_id: PeerId,
+    stream: Stream,
+    services: Arc<RwLock<HashMap<String, Box<dyn rpc::RpcService>>>>,
+) -> Result<()> {
     // split writer and reader
     let (mut reader, writer) = stream.split();
     let writer = Arc::new(Mutex::new(writer));
@@ -70,18 +74,17 @@ pub(crate) async fn handle_incoming_stream(stream: Stream, services: Arc<RwLock<
                 let request_id = req.id.clone();
                 let request_method = req.method.clone();
 
-                let parts: Vec<&str> = request_method.split('.').collect();
-                if parts.len() != 2 {
+                let Some(split_pos) = request_method.rfind('.') else {
                     let error_frame = rpc::StreamFrame::Error(rpc::StreamError{
                         id: request_id.clone(),
                         error: "Invalid method format".to_string()
                     });
                     let _ = send_frame(&writer, error_frame).await;
                     continue;
-                }
+                };
 
-                let service_name = parts[0].to_string();
-                let method_name = parts[1].to_string();
+                let service_name = request_method[..split_pos].to_string();
+                let method_name = request_method[split_pos + 1..].to_string();
 
                 // create data channel
                 let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(16);
@@ -108,7 +111,14 @@ pub(crate) async fn handle_incoming_stream(stream: Stream, services: Arc<RwLock<
                             data: Arc::from(complete_data),
                         };
 
-                        match service.handle_stream_iter(&method_name, complete_request.clone()).await {
+                        let ctx = rpc::RpcContext {
+                            remote_peer_id: peer_id,
+                        };
+
+                        match service
+                            .handle_stream_iter(ctx, &method_name, complete_request.clone())
+                            .await
+                        {
                             Ok(Some(mut rx)) => {
                                 let cancel_flag = Arc::new(AtomicBool::new(false));
                                 cancel_flags_clone.write().await.insert(request_id_clone.clone(), cancel_flag.clone());
@@ -139,7 +149,14 @@ pub(crate) async fn handle_incoming_stream(stream: Stream, services: Arc<RwLock<
                                 }
                             }
                             _ => {
-                                match service.handle_stream(&method_name, complete_request).await {
+                                let ctx = rpc::RpcContext {
+                                    remote_peer_id: peer_id,
+                                };
+
+                                match service
+                                    .handle_stream(ctx, &method_name, complete_request)
+                                    .await
+                                {
                                     Ok(stream_response) => {
                                         let chunk_size = 16 * 1024 * 1024;
                                         let total_chunks = (stream_response.data.len() + chunk_size - 1) / chunk_size;
@@ -223,12 +240,12 @@ pub(crate) async fn handle_request_event(event: request_response::Event<rpc::Rpc
                               pending_requests: &mut HashMap<OutboundRequestId, oneshot::Sender<Result<rpc::RpcResponse>>>,
                               config: &Config) {
     match event {
-        request_response::Event::Message {message, ..} => {
+        request_response::Event::Message {peer, message, ..} => {
             match message {
                 request_response::Message::Request {request, channel, ..} => {
                     {
                         let swarm_temp = swarm;
-                        handle_rpc_request(request, channel, services, swarm_temp, config).await;
+                        handle_rpc_request(peer, request, channel, services, swarm_temp, config).await;
                     }
                 }
                 request_response::Message::Response {response, request_id, ..} => {
@@ -338,6 +355,7 @@ pub(crate) async fn handle_kad_event(event: Event, queries: &mut FnvHashMap<Quer
 }
 
 pub(crate) async fn handle_rpc_request(
+    peer_id: PeerId,
     request: rpc::RpcMessage,
     channel: ResponseChannel<rpc::RpcMessage>,
     services: Arc<RwLock<HashMap<String, Box<dyn rpc::RpcService>>>>,
@@ -345,18 +363,18 @@ pub(crate) async fn handle_rpc_request(
     config: &Config) {
     match request {
         rpc::RpcMessage::Request(mut req) => {
-            let parts: Vec<&str> = req.method.split('.').collect();
-            if parts.len() != 2 {
+
+            let Some(split_pos) = req.method.rfind('.') else {
                 let error_response = rpc::RpcMessage::Error(rpc::RpcError {
                     id: req.id,
                     error: "Invalid method format".to_string(),
                 });
                 let _ = swarm.behaviour_mut().request_response.send_response(channel, error_response);
                 return;
-            }
+            };
 
-            let service_name = parts[0];
-            let method_name = parts[1];
+            let service_name = req.method[..split_pos].to_string();
+            let method = req.method[split_pos + 1..].to_string();
 
             if let Some(compression_algo) = req.compression {
                 match decompress_data(&req.data, compression_algo).await {
@@ -375,8 +393,12 @@ pub(crate) async fn handle_rpc_request(
             }
 
             let services_guard = services.read().await;
-            if let Some(service) = services_guard.get(service_name) {
-                match service.handle_request(method_name, req.clone()).await {
+            if let Some(service) = services_guard.get(&service_name) {
+                let ctx = rpc::RpcContext {
+                    remote_peer_id: peer_id,
+                };
+
+                match service.handle_request(ctx, &method, req.clone()).await {
                     Ok(mut response) => {
                         if should_compress(response.data.len(), config.compression_algorithm) {
                             match compress_data(&response.data, config.compression_algorithm, config.compression_level).await {
@@ -570,11 +592,10 @@ pub(crate) async fn handle_relay_event(config: &Config, swarm: &mut Swarm<Lattic
                             Ok(msgid) => {
                                 tracing::debug!("publish gossipsub message success: {:?}",msgid )
                             },
-                            Err(gossipsub::PublishError::InsufficientPeers) => {
-                                pending_relay_addrs.write().await.push(after_relay_addr.clone());
-                            }
                             Err(err) => {
-                                tracing::debug!("publish gossipsub message error: {:?}", err)
+                                // Queue address for retry on publish error (e.g., insufficient peers)
+                                tracing::debug!("publish gossipsub message error: {:?}", err);
+                                pending_relay_addrs.write().await.push(after_relay_addr.clone());
                             }
                         }
 
