@@ -9,9 +9,15 @@ use anyhow::{anyhow, Result};
 use bincode::{Decode, Encode};
 use tokio::task::JoinHandle;
 
+/// Prefix byte for record entries in sled, to distinguish from provider records.
+const RECORD_PREFIX: u8 = 0x00;
+/// Prefix byte for provider record entries in sled.
+const PROVIDER_PREFIX: u8 = 0x01;
+
 pub struct MultiStore {
     pub memory_store: Arc<RwLock<MemoryStore>>,
     pub persistent_store: Arc<RwLock<Db>>,
+    local_peer_id: PeerId,
     _cleanup_handle: Option<JoinHandle<()>>,
 }
 
@@ -23,6 +29,14 @@ struct StoredRecord {
     expires: Option<u64>
 }
 
+#[derive(Debug, Clone, Encode, Decode)]
+struct StoredProviderRecord {
+    key: Vec<u8>,
+    provider: Vec<u8>,
+    expires: Option<u64>,
+    addresses: Vec<Vec<u8>>,
+}
+
 impl From<Record> for StoredRecord {
     fn from(record: Record) -> Self {
         let expires = record.expires.map(|t| {
@@ -30,18 +44,17 @@ impl From<Record> for StoredRecord {
             let duration = t.saturating_duration_since(now);
             let unix_ts = SystemTime::now()
                 .checked_add(duration)
-                .unwrap()
+                .unwrap_or(SystemTime::now())
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_nanos() as u64;
             unix_ts
         });
 
-
         Self {
             key: record.key.as_ref().to_vec(),
             value: record.value.clone(),
-            publisher: Some(record.publisher.unwrap().to_bytes()),
+            publisher: record.publisher.map(|p| p.to_bytes()),
             expires,
         }
     }
@@ -70,15 +83,95 @@ impl From<StoredRecord> for Record {
     }
 }
 
+impl From<&ProviderRecord> for StoredProviderRecord {
+    fn from(record: &ProviderRecord) -> Self {
+        let expires = record.expires.map(|t| {
+            let now = Instant::now();
+            let duration = t.saturating_duration_since(now);
+            SystemTime::now()
+                .checked_add(duration)
+                .unwrap_or(SystemTime::now())
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64
+        });
+
+        Self {
+            key: record.key.as_ref().to_vec(),
+            provider: record.provider.to_bytes(),
+            expires,
+            addresses: record.addresses.iter().map(|a| a.to_vec()).collect(),
+        }
+    }
+}
+
+impl TryFrom<StoredProviderRecord> for ProviderRecord {
+    type Error = anyhow::Error;
+
+    fn try_from(stored: StoredProviderRecord) -> Result<Self> {
+        let provider = PeerId::from_bytes(&stored.provider)
+            .map_err(|e| anyhow!("invalid provider PeerId: {}", e))?;
+
+        let addresses: Vec<libp2p::Multiaddr> = stored.addresses
+            .into_iter()
+            .filter_map(|bytes| libp2p::Multiaddr::try_from(bytes).ok())
+            .collect();
+
+        let expires = stored.expires.map(|ts| {
+            let now_system = SystemTime::now();
+            let now_instant = Instant::now();
+            let expire_system = UNIX_EPOCH + Duration::from_secs(ts);
+            let delta = expire_system.duration_since(now_system).unwrap_or_default();
+            now_instant + delta
+        });
+
+        Ok(ProviderRecord {
+            key: RecordKey::new(&stored.key),
+            provider,
+            expires,
+            addresses,
+        })
+    }
+}
+
+/// Build a sled key for a regular DHT record.
+fn record_sled_key(key: &RecordKey) -> Vec<u8> {
+    let mut k = Vec::with_capacity(1 + key.as_ref().len());
+    k.push(RECORD_PREFIX);
+    k.extend_from_slice(key.as_ref());
+    k
+}
+
+/// Build a sled key for a provider record (unique per key+provider pair).
+fn provider_sled_key(key: &RecordKey, provider: &PeerId) -> Vec<u8> {
+    let provider_bytes = provider.to_bytes();
+    let mut k = Vec::with_capacity(1 + key.as_ref().len() + 1 + provider_bytes.len());
+    k.push(PROVIDER_PREFIX);
+    k.extend_from_slice(key.as_ref());
+    k.push(b'/');
+    k.extend_from_slice(&provider_bytes);
+    k
+}
+
+/// Build a sled key prefix for all providers of a given record key.
+fn provider_sled_prefix(key: &RecordKey) -> Vec<u8> {
+    let mut k = Vec::with_capacity(1 + key.as_ref().len() + 1);
+    k.push(PROVIDER_PREFIX);
+    k.extend_from_slice(key.as_ref());
+    k.push(b'/');
+    k
+}
+
 impl MultiStore {
     pub fn new(peer_id: PeerId, db_path: String) -> Result<Self> {
         let db = sled::open(db_path)?;
-        
+
         let memory_store = Arc::new(RwLock::new(MemoryStore::new(peer_id)));
 
         let mut store = Self{
             memory_store,
             persistent_store: Arc::new(RwLock::new(db)),
+            local_peer_id: peer_id,
             _cleanup_handle: None,
         };
 
@@ -87,7 +180,7 @@ impl MultiStore {
 
         let cleanup_handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(300));
-            
+
             loop {
                 interval.tick().await;
 
@@ -97,7 +190,7 @@ impl MultiStore {
                 ) {
                     tracing::error!("Failed to run store cleanup: {}", e);
                 }
-                tracing::debug!("Cleaning up finished");
+                tracing::debug!("Store cleanup finished");
             }
         });
 
@@ -106,29 +199,47 @@ impl MultiStore {
         Ok(store)
     }
 
-    pub fn warm_up(&mut self) ->Result<()> {
+    pub fn warm_up(&mut self) -> Result<()> {
         let db = self.persistent_store.read().map_err(|e| anyhow!(e.to_string()))?;
         let mut memory_store = self.memory_store.write().map_err(|e| anyhow!(e.to_string()))?;
 
         for result in db.iter() {
-            let (_, value) = result?;
+            let (key_bytes, value) = result?;
+
+            // Only warm up regular records (prefix 0x00), skip provider records
+            if key_bytes.first() != Some(&RECORD_PREFIX) {
+                continue;
+            }
 
             let stored: StoredRecord = bincode::decode_from_slice(&value, bincode::config::standard())
                 .map(|(data, _)| data)
-                .map_err(|e| e)?;
+                .map_err(|e| anyhow!("failed to decode stored record: {}", e))?;
 
-            let record = stored.into();
+            let record: Record = stored.into();
 
-            // only load not expired record
-            if !self.is_expired(&record) {
-                memory_store.put(record)?;
+            // Only load non-expired records
+            if !Self::is_record_expired(&record) {
+                let _ = memory_store.put(record);
             }
         }
-        
+
+        // Also warm up provider records into memory store
+        for result in db.scan_prefix([PROVIDER_PREFIX]) {
+            let (_, value) = result?;
+
+            if let Ok((stored, _)) = bincode::decode_from_slice::<StoredProviderRecord, _>(&value, bincode::config::standard()) {
+                if let Ok(provider_record) = ProviderRecord::try_from(stored) {
+                    if !Self::is_provider_expired(&provider_record) {
+                        let _ = memory_store.add_provider(provider_record);
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
-    fn is_expired(&self, record: &Record) -> bool {
+    fn is_record_expired(record: &Record) -> bool {
         if let Some(expires) = record.expires {
             expires < Instant::now()
         } else {
@@ -136,51 +247,120 @@ impl MultiStore {
         }
     }
 
+    fn is_provider_expired(record: &ProviderRecord) -> bool {
+        if let Some(expires) = record.expires {
+            expires < Instant::now()
+        } else {
+            false
+        }
+    }
+
+    /// Persist a provider record to sled synchronously.
+    fn persist_provider(db: &Db, record: &ProviderRecord) -> Result<()> {
+        let stored = StoredProviderRecord::from(record);
+        let serialized = bincode::encode_to_vec(&stored, bincode::config::standard())
+            .map_err(|e| anyhow!("failed to serialize provider record: {}", e))?;
+        let sled_key = provider_sled_key(&record.key, &record.provider);
+        db.insert(sled_key, serialized)?;
+        Ok(())
+    }
+
+    /// Remove a provider record from sled synchronously.
+    fn remove_persisted_provider(db: &Db, key: &RecordKey, provider: &PeerId) {
+        let sled_key = provider_sled_key(key, provider);
+        let _ = db.remove(sled_key);
+    }
+
+    /// Load all provider records for a given key from sled.
+    fn load_providers_from_sled(db: &Db, key: &RecordKey) -> Vec<ProviderRecord> {
+        let prefix = provider_sled_prefix(key);
+        let mut providers = Vec::new();
+
+        for result in db.scan_prefix(&prefix) {
+            if let Ok((_, value)) = result {
+                if let Ok((stored, _)) = bincode::decode_from_slice::<StoredProviderRecord, _>(&value, bincode::config::standard()) {
+                    if let Ok(record) = ProviderRecord::try_from(stored) {
+                        if !Self::is_provider_expired(&record) {
+                            providers.push(record);
+                        }
+                    }
+                }
+            }
+        }
+
+        providers
+    }
+
     fn cleanup(
         memory_store: &Arc<RwLock<MemoryStore>>,
         persistent_store: &Arc<RwLock<Db>>,
-    ) ->Result<()> {
+    ) -> Result<()> {
         let now_ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos() as u64;
 
         let now = Instant::now();
 
-        // clean memory store
-        if let Ok(mut memory_store) = memory_store.write() {
-            let mut expired_keys = Vec::new();
+        // Phase 1: Collect expired keys from memory store (read lock only)
+        let expired_keys = if let Ok(memory_store) = memory_store.read() {
+            memory_store.records()
+                .filter(|record| {
+                    record.expires.is_some_and(|expires| expires <= now)
+                })
+                .map(|record| record.key.clone())
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
 
-            for record in memory_store.records() {
-                if let Some(expires) = record.expires {
-                    if expires <= now {
-                        expired_keys.push(record.key.clone());
-                    }
+        // Phase 2: Remove expired keys from memory store (write lock, no scan)
+        if !expired_keys.is_empty() {
+            if let Ok(mut memory_store) = memory_store.write() {
+                for key in &expired_keys {
+                    memory_store.remove(key);
                 }
-            }
-
-            for key in expired_keys {
-                memory_store.remove(&key);
             }
         }
 
-        // clean persistent store
-        if let Ok(db) = persistent_store.write() {
-            let mut expired_keys = Vec::new();
-
+        // Phase 3: Collect expired keys from persistent store (read lock only)
+        let expired_persistent_keys = if let Ok(db) = persistent_store.read() {
+            let mut keys = Vec::new();
             for result in db.iter() {
                 if let Ok((key, value)) = result {
-                    if let Ok((stored, _)) = bincode::decode_from_slice::<StoredRecord, _>(&value, bincode::config::standard()) {
-                        if let Some(expires_nanos) = stored.expires {
-                            if expires_nanos <= now_ts {
-                                expired_keys.push(key.clone());
+                    match key.first() {
+                        Some(&RECORD_PREFIX) => {
+                            if let Ok((stored, _)) = bincode::decode_from_slice::<StoredRecord, _>(&value, bincode::config::standard()) {
+                                if let Some(expires_nanos) = stored.expires {
+                                    if expires_nanos <= now_ts {
+                                        keys.push(key.to_vec());
+                                    }
+                                }
                             }
                         }
+                        Some(&PROVIDER_PREFIX) => {
+                            if let Ok((stored, _)) = bincode::decode_from_slice::<StoredProviderRecord, _>(&value, bincode::config::standard()) {
+                                if let Some(expires_nanos) = stored.expires {
+                                    if expires_nanos <= now_ts {
+                                        keys.push(key.to_vec());
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
+            keys
+        } else {
+            Vec::new()
+        };
 
-            for key in expired_keys {
-                let _ = db.remove(&key);
+        // Phase 4: Remove expired keys from persistent store (write lock, no scan)
+        if !expired_persistent_keys.is_empty() {
+            if let Ok(db) = persistent_store.write() {
+                for key in expired_persistent_keys {
+                    let _ = db.remove(key);
+                }
             }
         }
 
@@ -193,21 +373,27 @@ impl Drop for MultiStore {
         if let Some(handle) = self._cleanup_handle.take() {
             handle.abort();
         }
+        // Flush the persistent store to ensure all writes are durable
+        if let Ok(db) = self.persistent_store.read() {
+            if let Err(e) = db.flush() {
+                tracing::error!("Failed to flush DHT store on drop: {}", e);
+            }
+        }
     }
 }
 
 impl RecordStore for MultiStore {
-    type RecordsIter<'a> = RecordsIterator<'a>;
+    type RecordsIter<'a> = Box<dyn Iterator<Item = Cow<'a, Record>> + 'a>;
 
     type ProvidedIter<'a> = Box<dyn Iterator<Item = Cow<'a, ProviderRecord>> + 'a>;
 
     fn get(&self, k: &RecordKey) -> Option<Cow<'_, Record>> {
         if let Ok(mut memory_store) = self.memory_store.write() {
-            if let Some(record ) = memory_store.get(k) {
+            if let Some(record) = memory_store.get(k) {
                 let record = record.into_owned();
 
                 // check expired
-                if self.is_expired(&record) {
+                if Self::is_record_expired(&record) {
                     memory_store.remove(k);
                     return None
                 }
@@ -217,15 +403,16 @@ impl RecordStore for MultiStore {
         }
 
         let db = self.persistent_store.try_read().ok()?;
-        if let Some(value) = db.get(k.as_ref()).ok().flatten() {
+        let sled_key = record_sled_key(k);
+        if let Some(value) = db.get(&sled_key).ok().flatten() {
             if let Ok((stored, _)) = bincode::decode_from_slice::<StoredRecord, _>(&value, bincode::config::standard()) {
                 let record: Record = stored.into();
                 // check expired
-                if self.is_expired(&record) {
-                    if let Ok(db) = self.persistent_store.write() {
-                        let _ = db.remove(k);
+                if Self::is_record_expired(&record) {
+                    drop(db);
+                    if let Ok(write_db) = self.persistent_store.write() {
+                        let _ = write_db.remove(&sled_key);
                     }
-
                     return None
                 }
 
@@ -239,63 +426,90 @@ impl RecordStore for MultiStore {
     }
 
     fn put(&mut self, v: Record) -> Result<(), Error> {
+        // Write to memory store
         if let Ok(mut memory_store) = self.memory_store.write() {
             memory_store.put(v.clone())?;
         }
 
-
+        // Write to persistent store synchronously for durability
         let stored_record = StoredRecord::from(v.clone());
         let serialized = bincode::encode_to_vec(&stored_record, bincode::config::standard())
             .unwrap_or_else(|_e| Vec::new());
 
-        let db = self.persistent_store.clone();
-
-        tokio::spawn(async move {
-            if let Ok(db) = db.write() {
-                let _ = db.insert(v.key.as_ref(), serialized);
-            }
-        });
+        if let Ok(db) = self.persistent_store.write() {
+            let sled_key = record_sled_key(&v.key);
+            let _ = db.insert(sled_key, serialized);
+        }
 
         Ok(())
     }
 
-    fn remove(&mut self, k: &RecordKey){
+    fn remove(&mut self, k: &RecordKey) {
         if let Ok(mut memory_store) = self.memory_store.write() {
             memory_store.remove(k);
         }
 
-        if let Ok(db) = self.persistent_store.read() {
-            let _ = db.remove(k.as_ref());
+        if let Ok(db) = self.persistent_store.write() {
+            let sled_key = record_sled_key(k);
+            let _ = db.remove(sled_key);
         }
     }
 
     fn records(&self) -> Self::RecordsIter<'_> {
-        let memory_iter = if let Ok(memory_store) = self.memory_store.read() {
-            let records: Vec<Cow<'static, Record>> = memory_store.records()
+        // Collect all non-expired records from memory store
+        let memory_records: Vec<Cow<'static, Record>> = if let Ok(memory_store) = self.memory_store.read() {
+            memory_store.records()
                 .filter_map(|cow| {
                     let record = cow.into_owned();
-                    if self.is_expired(&record) {
+                    if Self::is_record_expired(&record) {
                         None
                     } else {
                         Some(Cow::Owned(record))
                     }
                 })
-                .collect();
-            Box::new(records.into_iter()) as Box<dyn Iterator<Item = Cow<'_, Record>>>
+                .collect()
         } else {
-            Box::new(std::iter::empty()) as Box<dyn Iterator<Item = Cow<'_, Record>>>
+            Vec::new()
         };
 
-        let db = self.persistent_store.try_read().ok();
-        let persistent_iter = db.map(|db| db.iter());
+        // Collect non-expired records from persistent store that aren't already in memory
+        let persistent_records: Vec<Cow<'static, Record>> = if let Ok(db) = self.persistent_store.try_read() {
+            let memory_keys: std::collections::HashSet<Vec<u8>> = memory_records
+                .iter()
+                .map(|r| r.key.as_ref().to_vec())
+                .collect();
 
-        RecordsIterator {
-            memory_iter,
-            persistent_iter,
-        }
+            db.scan_prefix([RECORD_PREFIX])
+                .filter_map(|result| {
+                    let (_, value) = result.ok()?;
+                    let (stored, _) = bincode::decode_from_slice::<StoredRecord, _>(&value, bincode::config::standard()).ok()?;
+                    if memory_keys.contains(&stored.key) {
+                        return None; // already in memory
+                    }
+                    let record: Record = stored.into();
+                    if Self::is_record_expired(&record) {
+                        None
+                    } else {
+                        Some(Cow::Owned(record))
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        Box::new(memory_records.into_iter().chain(persistent_records.into_iter()))
     }
 
     fn add_provider(&mut self, record: ProviderRecord) -> Result<(), Error> {
+        // Persist to sled first (synchronous)
+        if let Ok(db) = self.persistent_store.write() {
+            if let Err(e) = Self::persist_provider(&db, &record) {
+                tracing::error!("Failed to persist provider record: {}", e);
+            }
+        }
+
+        // Then add to memory store
         if let Ok(mut memory_store) = self.memory_store.write() {
             let _ = memory_store.add_provider(record);
         }
@@ -304,57 +518,80 @@ impl RecordStore for MultiStore {
     }
 
     fn providers(&self, key: &RecordKey) -> Vec<ProviderRecord> {
+        // Try memory store first
         if let Ok(memory_store) = self.memory_store.read() {
-            return memory_store.providers(key);
+            let memory_providers = memory_store.providers(key);
+            if !memory_providers.is_empty() {
+                return memory_providers;
+            }
         }
+
+        // Fall back to persistent store
+        if let Ok(db) = self.persistent_store.try_read() {
+            let providers = Self::load_providers_from_sled(&db, key);
+            if !providers.is_empty() {
+                // Warm memory store with what we found
+                if let Ok(mut memory_store) = self.memory_store.write() {
+                    for p in &providers {
+                        let _ = memory_store.add_provider(p.clone());
+                    }
+                }
+                return providers;
+            }
+        }
+
         vec![]
     }
 
     fn provided(&self) -> Self::ProvidedIter<'_> {
+        // Memory store's `provided()` returns only records where we are the provider,
+        // which is the correct behavior. Collect and return.
         if let Ok(memory_store) = self.memory_store.read() {
             let vec: Vec<ProviderRecord> = memory_store.provided().map(|c| c.into_owned()).collect();
-            Box::new(vec.into_iter().map(Cow::Owned))
-        } else {
-            Box::new(std::iter::empty())
+
+            if !vec.is_empty() {
+                return Box::new(vec.into_iter().map(Cow::Owned));
+            }
         }
+
+        // Fall back to persistent store: scan for provider records where we are the provider
+        let local_peer_id = self.local_peer_id;
+        if let Ok(db) = self.persistent_store.try_read() {
+            let vec: Vec<ProviderRecord> = db.scan_prefix([PROVIDER_PREFIX])
+                .filter_map(|result| {
+                    let (_, value) = result.ok()?;
+                    let (stored, _) = bincode::decode_from_slice::<StoredProviderRecord, _>(&value, bincode::config::standard()).ok()?;
+                    let record = ProviderRecord::try_from(stored).ok()?;
+                    if record.provider == local_peer_id && !Self::is_provider_expired(&record) {
+                        Some(record)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            // Warm memory store
+            if !vec.is_empty() {
+                if let Ok(mut memory_store) = self.memory_store.write() {
+                    for p in &vec {
+                        let _ = memory_store.add_provider(p.clone());
+                    }
+                }
+            }
+
+            return Box::new(vec.into_iter().map(Cow::Owned));
+        }
+
+        Box::new(std::iter::empty())
     }
+
     fn remove_provider(&mut self, k: &RecordKey, p: &PeerId) {
         if let Ok(mut memory_store) = self.memory_store.write() {
             memory_store.remove_provider(k, p);
         }
-    }
-}
 
-pub struct RecordsIterator<'a> {
-    memory_iter: Box<dyn Iterator<Item = Cow<'a, Record>> + 'a>,
-    persistent_iter: Option<sled::Iter>,
-}
-
-impl<'a> Iterator for RecordsIterator<'a> {
-    type Item = Cow<'a, Record>;
-    fn next(&mut self) -> Option<Self::Item> {
-        if let Some(record) = self.memory_iter.next() {
-            return Some(record);
+        if let Ok(db) = self.persistent_store.write() {
+            Self::remove_persisted_provider(&db, k, p);
         }
-
-        if let Some(ref mut persistent_iter) = self.persistent_iter {
-            while let Some(result) = persistent_iter.next() {
-                if let Ok((_, value)) = result {
-                    if let Ok((stored, _)) = bincode::decode_from_slice::<StoredRecord, _>(&value, bincode::config::standard()) {
-                        let record: Record = stored.into();
-
-                        // check expired
-                        if let Some(expires) = record.expires {
-                            if expires <= Instant::now() {
-                                continue;
-                            }
-                        }
-                        
-                        return Some(Cow::Owned(record))
-                    }
-                }
-            }
-        }
-        None
     }
 }
