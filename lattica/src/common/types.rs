@@ -1,9 +1,13 @@
 use serde::{Serialize, Deserialize};
 use bincode::{Encode, Decode};
+#[cfg(feature = "bitswap")]
 use blockstore::block::{Block, CidError};
+#[cfg(feature = "bitswap")]
 use cid::{CidGeneric, Cid};
+#[cfg(feature = "bitswap")]
 use multihash_codetable::{Code, MultihashDigest};
 
+#[cfg(feature = "bitswap")]
 const RAW_CODEC: u64 = 0x55;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
@@ -34,10 +38,12 @@ pub struct QueryId(InnerQueryId);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum InnerQueryId {
+    #[cfg(feature = "bitswap")]
     Bitswap(beetswap::QueryId),
     Kad(libp2p::kad::QueryId),
 }
 
+#[cfg(feature = "bitswap")]
 impl From<beetswap::QueryId> for QueryId {
     fn from(id: beetswap::QueryId) -> Self {
         Self(InnerQueryId::Bitswap(id))
@@ -51,8 +57,10 @@ impl From<libp2p::kad::QueryId> for QueryId {
 }
 
 
+#[cfg(feature = "bitswap")]
 #[derive(Debug, Clone)]
 pub struct BytesBlock(pub Vec<u8>);
+#[cfg(feature = "bitswap")]
 impl Block<64> for BytesBlock {
     fn cid(&self) -> Result<CidGeneric<64>, CidError> {
         let hash = Code::Sha2_256.digest(&self.0);

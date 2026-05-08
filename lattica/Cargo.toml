@@ -2,6 +2,15 @@
 name = "lattica"
 edition = "2024"
 
+[features]
+default = []
+# BitSwap content-addressed block storage. Optional because beetswap +
+# blockstore transitively require multihash-codetable 0.1.x, which depends on
+# the now-yanked core2 crate. DHT record-store users (kad/store_simple/
+# store_subkey) don't need any of this. Enable explicitly with
+# `features = ["bitswap"]` if you need put_block/get_block/remove_block.
+bitswap = ["dep:beetswap", "dep:blockstore", "dep:multihash-codetable"]
+
 [dependencies]
 tokio = { version = "1.46.1", features = ["full"] }
 libp2p = { version = "0.56", features = ["full"] }
@@ -18,10 +27,10 @@ uuid = { version = "1.17.0", features = ["v4"] }
 tokio-stream = "0.1.17"
 rand = "0.8.5"
 chrono = "0.4.41"
-beetswap = "0.5.0"
-blockstore = {version = "0.8.0", features = ["sled"]}
+beetswap = { version = "0.5.0", optional = true }
+blockstore = { version = "0.8.0", features = ["sled"], optional = true }
 cid = "0.11.1"
-multihash-codetable = {version = "0.1.4", features = ["sha2"]}
+multihash-codetable = { version = "0.1.4", features = ["sha2"], optional = true }
 async-compression = {version = "0.4.30", features = ["tokio", "gzip", "zstd", "lz4", "brotli"]}
 clap = { version = "4.5.41", features = ["derive"] }
 serde_json = "1.0.143"
@@ -31,6 +40,8 @@ bytecodec = "0.5.0"
 
 [[example]]
 name = "bitswap"
+required-features = ["bitswap"]
+
 [[example]]
 name = "dcutr"
 [[example]]
