@@ -14,7 +14,9 @@ use bincode::config::standard;
 use fnv::{FnvHashMap};
 use libp2p_stream::Control;
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
-use crate::common::{compress_data, decompress_data, should_compress, BytesBlock, QueryId, P2P_CIRCUIT_TOPIC};
+#[cfg(feature = "bitswap")]
+use crate::common::BytesBlock;
+use crate::common::{compress_data, decompress_data, should_compress, QueryId, P2P_CIRCUIT_TOPIC};
 use libp2p::kad::{AddProviderOk, GetProvidersOk};
 use std::sync::atomic::{AtomicBool, Ordering};
 use futures::io::{WriteHalf};
@@ -665,6 +667,7 @@ pub(crate) async fn handle_gossipsub_event(event: gossipsub::Event, swarm: &mut 
     }
 }
 
+#[cfg(feature = "bitswap")]
 pub(crate) async fn handle_bitswap_event(event: beetswap::Event, queries: &mut FnvHashMap<QueryId, QueryChannel>) {
     match event {
         beetswap::Event::GetQueryResponse {query_id, data} => {
@@ -673,7 +676,7 @@ pub(crate) async fn handle_bitswap_event(event: beetswap::Event, queries: &mut F
                 ch.send(Ok(block)).ok();
             }
         },
-        
+
         beetswap::Event::GetQueryError {query_id, error} => {
             if let Some(QueryChannel::Get(ch)) = queries.remove(&query_id.into()) {
                 ch.send(Err(anyhow!(error))).ok();

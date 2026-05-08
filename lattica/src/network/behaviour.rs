@@ -1,3 +1,4 @@
+#[cfg(feature = "bitswap")]
 use std::sync::Arc;
 use std::time::Duration;
 use super::{*};
@@ -5,10 +6,14 @@ use crate::rpc;
 use tokio::sync::{oneshot};
 use libp2p::{autonat, dcutr, gossipsub, identify, kad, mdns, ping, relay, rendezvous, upnp, swarm::{NetworkBehaviour, behaviour::toggle::Toggle}, kad::{Quorum, Record, PeerRecord, RecordKey, K_VALUE}, request_response, PeerId, gossipsub::{MessageAuthenticity}, StreamProtocol};
 use anyhow::{anyhow, Result};
+#[cfg(feature = "bitswap")]
 use blockstore::{SledBlockstore};
 use fnv::{FnvHashMap};
 use libp2p_stream as stream;
-use crate::common::{BytesBlock, QueryId, P2P_CIRCUIT_TOPIC};
+#[cfg(feature = "bitswap")]
+use crate::common::BytesBlock;
+use crate::common::{QueryId, P2P_CIRCUIT_TOPIC};
+#[cfg(feature = "bitswap")]
 use cid::Cid;
 
 pub enum QueryChannel {
@@ -21,6 +26,7 @@ pub enum QueryChannel {
     Bootstrap(oneshot::Sender<Result<()>>),
     RendezvousRegister(oneshot::Sender<Result<()>>),
     RendezvousDiscover(oneshot::Sender<Result<Vec<PeerId>>>),
+    #[cfg(feature = "bitswap")]
     Get(oneshot::Sender<Result<BytesBlock>>),
     StartProviding(oneshot::Sender<Result<()>>),
     GetProviders(oneshot::Sender<Result<Vec<PeerId>>>),
@@ -40,11 +46,16 @@ pub struct LatticaBehaviour{
     pub dcutr: Toggle<dcutr::Behaviour>,
     pub relay: Toggle<relay::client::Behaviour>,
     pub gossipsub: gossipsub::Behaviour,
+    #[cfg(feature = "bitswap")]
     pub bitswap: Toggle<beetswap::Behaviour<64, SledBlockstore>>
 }
 
 impl LatticaBehaviour{
-    pub fn new(config: &mut Config, relay_behavior: Option<relay::client::Behaviour>, storage: Arc<SledBlockstore>) -> Self {
+    pub fn new(
+        config: &mut Config,
+        relay_behavior: Option<relay::client::Behaviour>,
+        #[cfg(feature = "bitswap")] storage: Arc<SledBlockstore>,
+    ) -> Self {
         let peer_id = config.keypair.public().to_peer_id();
         let proto_version: &'static str = Box::leak(config.protocol_version.clone().into_boxed_str());
 
@@ -119,6 +130,7 @@ impl LatticaBehaviour{
         let topic = gossipsub::IdentTopic::new(P2P_CIRCUIT_TOPIC);
         gossipsub.subscribe(&topic).unwrap();
 
+        #[cfg(feature = "bitswap")]
         let sd_behaviour = Toggle::from(Some(beetswap::Behaviour::<64, SledBlockstore>::new(storage)));
 
         Self{
@@ -137,6 +149,7 @@ impl LatticaBehaviour{
             dcutr,
             relay,
             gossipsub,
+            #[cfg(feature = "bitswap")]
             bitswap: sd_behaviour,
         }
     }
@@ -227,6 +240,7 @@ impl LatticaBehaviour{
         }
     }
 
+    #[cfg(feature = "bitswap")]
     pub fn get(&mut self, cid: Cid, queries: &mut FnvHashMap<QueryId, QueryChannel>, tx: oneshot::Sender<Result<BytesBlock>>) -> Option<QueryId> {
         if let Some(bitswap) = self.bitswap.as_mut() {
             let id = bitswap.get(&cid);

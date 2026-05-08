@@ -20,9 +20,14 @@ use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tokio::sync::{broadcast, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use std::time::{Duration, Instant};
+#[cfg(feature = "bitswap")]
 use blockstore::{Blockstore, SledBlockstore};
+#[cfg(feature = "bitswap")]
 use blockstore::block::Block;
-use crate::common::{compress_data, should_compress, BytesBlock, CompressionAlgorithm, CompressionLevel, QueryId};
+#[cfg(feature = "bitswap")]
+use crate::common::BytesBlock;
+use crate::common::{compress_data, should_compress, CompressionAlgorithm, CompressionLevel, QueryId};
+#[cfg(feature = "bitswap")]
 use cid::Cid;
 use futures::io::{WriteHalf};
 
@@ -37,6 +42,7 @@ pub enum Command{
     RendezvousRegister(PeerId, Option<String>, Option<u64>, oneshot::Sender<Result<()>>),
     RendezvousDiscover(PeerId, Option<String>, Option<u64>, oneshot::Sender<Result<Vec<PeerId>>>),
     GetVisibleMAddrs(oneshot::Sender<Result<Vec<Multiaddr>>>),
+    #[cfg(feature = "bitswap")]
     Get(Cid, oneshot::Sender<Result<BytesBlock>>, oneshot::Sender<Option<QueryId>>),
     CancelGet(QueryId),
     StartProviding(RecordKey, oneshot::Sender<Result<()>>),
@@ -68,6 +74,7 @@ pub struct Lattica {
     cmd: mpsc::Sender<Command>,
     config: Arc<Config>,
     address_book: Arc<RwLock<AddressBook>>,
+    #[cfg(feature = "bitswap")]
     storage: Arc<SledBlockstore>,
     symmetric_nat: Arc<RwLock<Option<bool>>>,
     gossip_tx: broadcast::Sender<GossipMessage>,
@@ -233,9 +240,12 @@ impl LatticaBuilder {
             self.config.protocol_version = format!("/{}", self.config.keypair.public().to_peer_id().to_string());
         }
 
-        let db = sled::open(self.config.clone().storage_path)?;
-        let storage = SledBlockstore::new(db).await?;
-        let storage_arc = Arc::new(storage);
+        #[cfg(feature = "bitswap")]
+        let storage_arc = {
+            let db = sled::open(self.config.clone().storage_path)?;
+            let storage = SledBlockstore::new(db).await?;
+            Arc::new(storage)
+        };
 
         let mut swarm = SwarmBuilder::with_existing_identity(self.config.keypair.clone())
             .with_tokio()
@@ -255,7 +265,12 @@ impl LatticaBuilder {
                     None
                 };
 
-                LatticaBehaviour::new(&mut self.config, relay_client, storage_arc.clone())
+                LatticaBehaviour::new(
+                    &mut self.config,
+                    relay_client,
+                    #[cfg(feature = "bitswap")]
+                    storage_arc.clone(),
+                )
             })?
             .with_swarm_config(|c| c.with_idle_connection_timeout(self.config.idle_timeout))
             .build();
@@ -332,6 +347,7 @@ impl LatticaBuilder {
             cmd: cmd_tx,
             config: Arc::new(self.config),
             address_book: address_book_arc,
+            #[cfg(feature = "bitswap")]
             storage: storage_arc,
             symmetric_nat,
             gossip_tx,
@@ -951,6 +967,7 @@ impl Lattica {
         address_book.info(peer_id)?.rtt()
     }
 
+    #[cfg(feature = "bitswap")]
     pub async fn get_block(&self, cid: &Cid, timeout: Duration) -> Result<BytesBlock> {
         let (tx, rx) = oneshot::channel();
         let (query_id_tx, query_id_rx) = oneshot::channel();
@@ -977,12 +994,14 @@ impl Lattica {
         }
     }
 
+    #[cfg(feature = "bitswap")]
     pub async fn put_block(&self, block: &BytesBlock) -> Result<Cid> {
         let cid = block.cid()?;
         self.storage.put_keyed(&cid, block.data()).await?;
         Ok(cid)
     }
 
+    #[cfg(feature = "bitswap")]
     pub async fn remove_block(&self, cid: &Cid) -> Result<()> {
         self.storage.remove(&cid).await?;
         Ok(())
@@ -1207,6 +1226,7 @@ async fn swarm_poll(
                             }
                             handle_gossipsub_event(gossipsub_event, &mut swarm, &pending_relay_addrs).await;
                         }
+                        #[cfg(feature = "bitswap")]
                         LatticaBehaviourEvent::Bitswap(bitswap_event) => {
                             tracing::info!("bitswap event {:?}", bitswap_event);
                             handle_bitswap_event(bitswap_event, &mut queries).await;
@@ -1296,16 +1316,20 @@ async fn swarm_poll(
                         .collect::<Vec<Multiaddr>>();
                     let _ = tx.send(Ok(result));
                 }
+                #[cfg(feature = "bitswap")]
                 Command::Get(cid, tx, query_id_tx) => {
                     // get() returns Option<QueryId>, send it back so caller can cancel if needed
                     let query_id = swarm.behaviour_mut().get(cid, &mut queries, tx);
                     let _ = query_id_tx.send(query_id);
                 }
                 Command::CancelGet(query_id) => {
+                    #[cfg(feature = "bitswap")]
                     if let Some(QueryChannel::Get(ch)) = queries.remove(&query_id) {
                         // Send error to indicate cancellation, then drop the channel
                         let _ = ch.send(Err(anyhow!("Query cancelled")));
                     }
+                    #[cfg(not(feature = "bitswap"))]
+                    let _ = query_id;
                 }
                 Command::StartProviding(key, tx) => {
                     swarm.behaviour_mut().start_providing(key, tx, &mut queries);
